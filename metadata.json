@@ -1,0 +1,6 @@
+{
+  "name": "NutriLens - Smart Food & Nutrition Scanner",
+  "description": "Scan packaged foods with OCR and analyze Indian meals to inspect calories, calculate Nutri-Scores, evaluate portions, and get dietary insights.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

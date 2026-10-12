@@ -1,0 +1,499 @@
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import type {
+  AnalyzedProduct,
+  AnalysisMode,
+  Nutrient,
+  IngredientExplanation,
+  AlternativeProduct,
+  ChatMessage,
+  IndianDishOption,
+  MealItemInput,
+  UserProfile,
+} from "../types";
+import { buildNutrients, calculateNutriScore, getGradeColors } from "./nutritionScoringService";
+import { getApiKey } from "./storageService";
+
+function getClient(): GoogleGenerativeAI {
+  const key = getApiKey();
+  if (!key) throw new Error("Gemini API key not configured. Please add it in Profile → Settings.");
+  return new GoogleGenerativeAI(key);
+}
+
+function imageDataUrlToGenerativePart(dataUrl: string) {
+  const [meta, base64Data] = dataUrl.split(",");
+  const mimeType = meta?.match(/:(.*?);/)?.[1] ?? "image/jpeg";
+  return {
+    inlineData: { data: base64Data ?? "", mimeType },
+  };
+}
+
+function readRequiredNutrition(parsed: Record<string, unknown>) {
+  const keys = [
+    "calories",
+    "saturatedFat",
+    "sugars",
+    "sodium",
+    "fiber",
+    "protein",
+  ] as const;
+  const values: Record<(typeof keys)[number], number> = {
+    calories: 0,
+    saturatedFat: 0,
+    sugars: 0,
+    sodium: 0,
+    fiber: 0,
+    protein: 0,
+  };
+
+  for (const key of keys) {
+    const value = Number(parsed[key]);
+    if (parsed[key] === null || parsed[key] === undefined || !Number.isFinite(value) || value < 0) {
+      throw new Error(`AI analysis did not return a valid value for ${key}. Please retake the image.`);
+    }
+    values[key] = value;
+  }
+  return values;
+}
+
+// ─── Optional Indian meal recognition prefill ────────────────────────────────
+
+export async function suggestIndianMealItems(
+  imageDataUrl: string,
+  dishes: IndianDishOption[],
+): Promise<MealItemInput[]> {
+  const client = getClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const allowed = dishes.map((dish) => ({
+    id: dish.id,
+    name: dish.name,
+    aliases: dish.aliases,
+  }));
+
+  const prompt = `Identify only the visible foods in this Indian meal image.
+Choose exclusively from this supported catalogue:
+${JSON.stringify(allowed)}
+
+Return JSON only in this exact shape:
+{"dishIds":["exact_catalogue_id"]}
+
+Rules:
+- Return at most 10 unique IDs.
+- Do not return nutrients, weights, ingredients, or foods outside the catalogue.
+- Omit uncertain items. The user will verify every suggestion.`;
+
+  const result = await model.generateContent([
+    prompt,
+    imageDataUrlToGenerativePart(imageDataUrl),
+  ]);
+  const responseText = result.response.text();
+
+  try {
+    const jsonText = responseText.replace(/```json?\n?/g, "").replace(/```/g, "").trim();
+    const parsed = JSON.parse(jsonText) as { dishIds?: unknown };
+    if (!Array.isArray(parsed.dishIds)) return [];
+
+    const byId = new Map(dishes.map((dish) => [dish.id, dish]));
+    const uniqueIds = Array.from(
+      new Set(parsed.dishIds.filter((id): id is string => typeof id === "string")),
+    ).slice(0, 10);
+
+    return uniqueIds.flatMap((dishId) => {
+      const dish = byId.get(dishId);
+      if (!dish) return [];
+      return [{
+        dishId,
+        portionGrams: dish.defaultPortion.grams,
+        portionBasis: "estimated" as const,
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+// ─── Packaged Food Label Analysis ─────────────────────────────────────────────
+
+export async function analyzePackagedFoodImage(
+  imageDataUrl: string,
+  ocrText: string,
+  onProgress?: (status: string) => void
+): Promise<AnalyzedProduct> {
+  onProgress?.("Analyzing food label with AI...");
+  const client = getClient();
+
+
+  const prompt = `You are a food nutrition analyst. Analyze this packaged food product label image.
+${ocrText ? `\nOCR text extracted from the label:\n"""${ocrText}"""\n` : ""}
+Be as accurate as possible. If you can read values from the image, use those. If some values are unclear, make your best estimate based on the product type. If the image is completely unreadable or not a food label, return "Unknown Product" and 0 for all numerical values.`;
+
+  const model = client.getGenerativeModel({ 
+    model: "gemini-2.0-flash",
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.OBJECT,
+        properties: {
+          name: { type: SchemaType.STRING },
+          brand: { type: SchemaType.STRING },
+          servingSize: { type: SchemaType.STRING },
+          ingredients: { type: SchemaType.STRING },
+          allergens: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+          calories: { type: SchemaType.NUMBER },
+          saturatedFat: { type: SchemaType.NUMBER },
+          sugars: { type: SchemaType.NUMBER },
+          sodium: { type: SchemaType.NUMBER },
+          fiber: { type: SchemaType.NUMBER },
+          protein: { type: SchemaType.NUMBER },
+          per100g: { type: SchemaType.BOOLEAN },
+        },
+        required: ["name", "brand", "servingSize", "ingredients", "allergens", "calories", "saturatedFat", "sugars", "sodium", "fiber", "protein", "per100g"]
+      }
+    }
+  });
+
+  const imagePart = imageDataUrlToGenerativePart(imageDataUrl);
+  const result = await model.generateContent([prompt, imagePart]);
+  const responseText = result.response.text();
+
+  onProgress?.("Processing nutrition data...");
+
+  let parsed: Record<string, unknown>;
+  try {
+    const jsonStr = responseText.replace(/```json?\n?/g, "").replace(/```/g, "").trim();
+    parsed = JSON.parse(jsonStr);
+  } catch {
+    throw new Error("Failed to parse AI response. Please try scanning again.");
+  }
+
+  const nutritionValues = readRequiredNutrition(parsed);
+  const nutrients = buildNutrients(nutritionValues);
+
+  const { score, grade } = calculateNutriScore(nutrients);
+  const { gradeColor, gradeBg } = getGradeColors(grade);
+
+  return {
+    id: `product_${Date.now()}`,
+    name: String(parsed.name || "Unknown Product"),
+    brand: String(parsed.brand || "Unknown Brand"),
+    score,
+    grade,
+    gradeColor,
+    gradeBg,
+    kcal: nutritionValues.calories,
+    servingSize: String(parsed.servingSize || "1 serving"),
+    allergens: Array.isArray(parsed.allergens) ? parsed.allergens.map(String) : [],
+    nutrients,
+    aiSummary: "", // Will be filled by generateAISummary
+    image: imageDataUrl,
+    ingredients: String(parsed.ingredients || "Not available"),
+    analysisMode: "label",
+    rawOcrText: ocrText,
+  };
+}
+
+// ─── Prepared Food Analysis ───────────────────────────────────────────────────
+
+export async function analyzePreparedFoodImage(
+  imageDataUrl: string,
+  onProgress?: (status: string) => void
+): Promise<AnalyzedProduct> {
+  onProgress?.("Identifying food items...");
+  const client = getClient();
+
+
+  const prompt = `You are a nutritionist and food recognition expert. Analyze this image of prepared/cooked food.
+
+Identify all visible food items and estimate their nutritional values combined.
+
+Be realistic with estimates. Use visual anchors (like the size of a plate or utensils) to accurately estimate portion sizes. If the image is completely unreadable or not food, return "Unknown Meal" and 0 for numerical values.`;
+
+  const model = client.getGenerativeModel({ 
+    model: "gemini-2.0-flash",
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.OBJECT,
+        properties: {
+          name: { type: SchemaType.STRING, description: "descriptive name of the dish/meal" },
+          brand: { type: SchemaType.STRING, description: "'Homemade' or restaurant name if visible" },
+          servingSize: { type: SchemaType.STRING, description: "estimated portion size e.g. '1 plate (350g)'" },
+          foodItems: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING }, description: "list of identified food items" },
+          ingredients: { type: SchemaType.STRING, description: "likely ingredients based on what you see" },
+          allergens: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING }, description: "potential allergens" },
+          calories: { type: SchemaType.NUMBER, description: "estimated total calories" },
+          saturatedFat: { type: SchemaType.NUMBER },
+          sugars: { type: SchemaType.NUMBER },
+          sodium: { type: SchemaType.NUMBER },
+          fiber: { type: SchemaType.NUMBER },
+          protein: { type: SchemaType.NUMBER },
+          carbs: { type: SchemaType.NUMBER },
+          totalFat: { type: SchemaType.NUMBER },
+        },
+        required: ["name", "brand", "servingSize", "foodItems", "ingredients", "allergens", "calories", "saturatedFat", "sugars", "sodium", "fiber", "protein", "carbs", "totalFat"]
+      }
+    }
+  });
+
+  const imagePart = imageDataUrlToGenerativePart(imageDataUrl);
+  const result = await model.generateContent([prompt, imagePart]);
+  const responseText = result.response.text();
+
+  onProgress?.("Estimating nutritional values...");
+
+  let parsed: Record<string, unknown>;
+  try {
+    const jsonStr = responseText.replace(/```json?\n?/g, "").replace(/```/g, "").trim();
+    parsed = JSON.parse(jsonStr);
+  } catch {
+    throw new Error("Failed to parse AI response. Please try again with a clearer image.");
+  }
+
+  const nutritionValues = readRequiredNutrition(parsed);
+  const nutrients = buildNutrients(nutritionValues);
+
+  const { score, grade } = calculateNutriScore(nutrients);
+  const { gradeColor, gradeBg } = getGradeColors(grade);
+
+  const foodItems = Array.isArray(parsed.foodItems) ? parsed.foodItems.map(String) : [];
+
+  return {
+    id: `food_${Date.now()}`,
+    name: String(parsed.name || "Prepared Meal"),
+    brand: String(parsed.brand || "Homemade"),
+    score,
+    grade,
+    gradeColor,
+    gradeBg,
+    kcal: nutritionValues.calories,
+    servingSize: String(parsed.servingSize || "1 serving"),
+    allergens: Array.isArray(parsed.allergens) ? parsed.allergens.map(String) : [],
+    nutrients,
+    aiSummary: "",
+    image: imageDataUrl,
+    ingredients: foodItems.length > 0
+      ? `Identified items: ${foodItems.join(", ")}. ${String(parsed.ingredients || "")}`
+      : String(parsed.ingredients || "Not available"),
+    analysisMode: "food",
+  };
+}
+
+// ─── AI Summary Generation ────────────────────────────────────────────────────
+
+export async function generateAISummary(
+  product: AnalyzedProduct,
+  userProfile?: UserProfile
+): Promise<string> {
+  const client = getClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+  const profileContext = userProfile
+    ? `\nUser profile: ${userProfile.allergens.length > 0 ? `Allergens: ${userProfile.allergens.join(", ")}. ` : ""}${userProfile.dietPreferences.length > 0 ? `Diet: ${userProfile.dietPreferences.join(", ")}. ` : ""}Daily calorie goal: ${userProfile.dailyCalories}kcal. Protein goal: ${userProfile.proteinGoal}g. Sodium limit: ${userProfile.sodiumLimit}mg.`
+    : "";
+
+  const mlContext = product.mlPrediction
+    ? `\nML Model Assessment: Predicted Grade ${product.mlPrediction.predictedGrade}${product.mlPrediction.confidence != null ? ` (${Math.round(product.mlPrediction.confidence * 100)}% confidence)` : ""}. ${product.mlPrediction.riskFactors?.length ? `Risk factors: ${product.mlPrediction.riskFactors.map((rf) => `${rf.factor} (${rf.severity})`).join(", ")}.` : ""}`
+    : "";
+
+  const prompt = `Write a concise 3-4 sentence health assessment for this food product. Be direct and actionable.
+${profileContext}${mlContext}
+
+Product: ${product.name} by ${product.brand}
+Score: ${product.score}/100 (Grade ${product.grade})
+Mode: ${product.analysisMode === "food" ? "Prepared food analysis (estimates)" : "Packaged food label"}
+Serving: ${product.servingSize}
+Nutrients: ${product.nutrients.map((n) => `${n.name}: ${n.value} (${n.rating})`).join(", ")}
+Allergens: ${product.allergens.join(", ") || "None detected"}
+Ingredients: ${product.ingredients}
+
+${product.analysisMode === "food" ? "Note: Values are AI estimates from the food image." : ""}
+Include personalized advice if user profile is available. Mention allergen warnings if relevant. If ML Model Assessment risk factors are present, briefly explain them to the user.`;
+
+  const result = await model.generateContent(prompt);
+  return result.response.text().trim();
+}
+
+// ─── Ingredient Explanations ──────────────────────────────────────────────────
+
+export async function explainIngredients(
+  ingredients: string
+): Promise<IngredientExplanation[]> {
+  const client = getClient();
+
+
+  const prompt = `Analyze these food ingredients and explain each one.
+
+Ingredients: "${ingredients}"
+
+Rate concern levels:
+- "none": Natural/whole food ingredients
+- "low": Generally safe additives, vitamins, minerals
+- "moderate": Processed ingredients, may cause issues for sensitive individuals
+- "high": Artificial additives, excess sodium/sugar sources, controversial preservatives
+
+Be factual and balanced. Max 10 ingredients.`;
+
+  const model = client.getGenerativeModel({ 
+    model: "gemini-2.0-flash",
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.ARRAY,
+        items: {
+          type: SchemaType.OBJECT,
+          properties: {
+            name: { type: SchemaType.STRING },
+            purpose: { type: SchemaType.STRING, description: "why it is used (1 sentence)" },
+            healthNote: { type: SchemaType.STRING, description: "health consideration (1 sentence)" },
+            concern: {
+              type: SchemaType.STRING,
+              format: "enum",
+              enum: ["none", "low", "moderate", "high"],
+            },
+          },
+          required: ["name", "purpose", "healthNote", "concern"],
+        },
+      },
+    },
+  });
+
+  const result = await model.generateContent(prompt);
+  const responseText = result.response.text();
+
+  try {
+    return JSON.parse(responseText) as IngredientExplanation[];
+  } catch {
+    return [];
+  }
+}
+
+// ─── Alternative Product Suggestions ──────────────────────────────────────────
+
+export async function suggestAlternatives(
+  product: AnalyzedProduct,
+  userProfile?: UserProfile
+): Promise<AlternativeProduct[]> {
+  const client = getClient();
+
+
+  const prompt = `You are a nutrition expert with extensive knowledge of food products available worldwide.
+
+The user scanned: "${product.name}" by ${product.brand}
+Score: ${product.score}/100 (Grade ${product.grade})
+Key issues: ${product.nutrients.filter((n) => n.rating === "bad").map((n) => `${n.name}: ${n.value}`).join(", ") || "None"}
+${userProfile?.allergens.length ? `User allergens to avoid: ${userProfile.allergens.join(", ")}` : ""}
+${userProfile?.dietPreferences.length ? `User diet: ${userProfile.dietPreferences.join(", ")}` : ""}
+
+Search your knowledge of real products available in stores and online. Suggest 3 healthier alternative products in the same category. These must be REAL products that actually exist and are commonly available.
+
+Only suggest products that would be genuinely better. If the scanned product is already excellent (score 85+), say so and suggest equally good options.`;
+
+  const model = client.getGenerativeModel({ 
+    model: "gemini-2.0-flash",
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.ARRAY,
+        items: {
+          type: SchemaType.OBJECT,
+          properties: {
+            name: { type: SchemaType.STRING, description: "Real Product Name" },
+            brand: { type: SchemaType.STRING, description: "Actual Brand" },
+            reason: { type: SchemaType.STRING, description: "Why this is better (1 sentence, mention specific nutritional advantages)" },
+            estimatedScore: { type: SchemaType.NUMBER, description: "0-100, your best estimate" }
+          },
+          required: ["name", "brand", "reason", "estimatedScore"]
+        }
+      }
+    }
+  });
+
+  const result = await model.generateContent(prompt);
+  const responseText = result.response.text();
+
+  try {
+    return JSON.parse(responseText) as AlternativeProduct[];
+  } catch {
+    return [];
+  }
+}
+
+// ─── Interactive Chat ─────────────────────────────────────────────────────────
+
+export async function chatAboutFood(
+  product: AnalyzedProduct,
+  messages: ChatMessage[],
+  userQuery: string,
+  userProfile?: UserProfile
+): Promise<string> {
+  const client = getClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+  const context = `You are NutriLens AI, a friendly nutrition assistant. You're discussing a food product with the user.
+
+Product: ${product.name} by ${product.brand}
+Score: ${product.score}/100 (Grade ${product.grade})
+Serving: ${product.servingSize} (${product.kcal} kcal)
+Nutrients: ${product.nutrients.map((n) => `${n.name}: ${n.value} (${n.rating})`).join(", ")}
+Allergens: ${product.allergens.join(", ") || "None"}
+Ingredients: ${product.ingredients}
+Analysis type: ${product.analysisMode === "food" ? "AI-estimated from food photo" : "Extracted from product label"}
+${product.mlPrediction ? `ML Prediction Context: Grade ${product.mlPrediction.predictedGrade}${product.mlPrediction.confidence != null ? ` (${Math.round(product.mlPrediction.confidence * 100)}% confidence)` : ""}. Risk factors: ${product.mlPrediction.riskFactors?.map((rf) => rf.factor).join(", ") || "None"}.` : ""}
+${userProfile ? `\nUser: ${userProfile.name}. Allergens: ${userProfile.allergens.join(", ") || "none"}. Diet: ${userProfile.dietPreferences.join(", ") || "no restrictions"}. Daily goals: ${userProfile.dailyCalories}kcal, ${userProfile.proteinGoal}g protein, ${userProfile.sodiumLimit}mg sodium limit.` : ""}
+
+Answer the user's question concisely (2-3 sentences). Be helpful, accurate, and practical. You have access to broad internet knowledge about nutrition, food science, and health.`;
+
+  const chatHistory = messages.map((m) => `${m.role === "user" ? "User" : "NutriLens"}: ${m.content}`).join("\n");
+
+  const prompt = `${context}
+
+${chatHistory ? `Previous conversation:\n${chatHistory}\n` : ""}
+User: ${userQuery}
+
+Respond as NutriLens AI:`;
+
+  const result = await model.generateContent(prompt);
+  return result.response.text().trim();
+}
+
+// ─── Recipe Generation ────────────────────────────────────────────────────────
+
+export async function generateHealthyRecipe(
+  ingredients: string,
+  userProfile?: UserProfile
+): Promise<string> {
+  const client = getClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+  const profileContext = userProfile
+    ? `\nUser profile: ${userProfile.allergens.length > 0 ? `Allergens to avoid: ${userProfile.allergens.join(", ")}. ` : ""}${userProfile.dietPreferences.length > 0 ? `Diet: ${userProfile.dietPreferences.join(", ")}. ` : ""}Daily goals: ${userProfile.dailyCalories}kcal, ${userProfile.proteinGoal}g protein, ${userProfile.sodiumLimit}mg sodium limit.`
+    : "";
+
+  const prompt = `You are a professional healthy chef. Create a delicious, healthy recipe using some or all of the following ingredients.
+Ingredients available: "${ingredients}"
+${profileContext}
+
+Provide the recipe in Markdown format with the following sections:
+- Recipe Name (Header 3)
+- Brief Description (1-2 sentences explaining why it's healthy)
+- Ingredients (List exact measurements, feel free to add basic pantry staples like salt, pepper, olive oil, water)
+- Instructions (Numbered list)
+- Estimated Nutrition (Per serving: Calories, Protein, Carbs, Fat)
+
+Keep it practical and easy to make.`;
+
+  const result = await model.generateContent(prompt);
+  return result.response.text().trim();
+}
+
+// ─── API Key Validation ───────────────────────────────────────────────────────
+
+export async function validateApiKey(key: string): Promise<boolean> {
+  try {
+    const client = new GoogleGenerativeAI(key);
+    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+    await model.generateContent("Say OK");
+    return true;
+  } catch {
+    return false;
+  }
+}
