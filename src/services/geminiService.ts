@@ -485,15 +485,55 @@ Keep it practical and easy to make.`;
   return result.response.text().trim();
 }
 
-// ─── API Key Validation ───────────────────────────────────────────────────────
+export interface ApiKeyValidationResult {
+  valid: boolean;
+  error?: string;
+  models?: string[];
+}
 
-export async function validateApiKey(key: string): Promise<boolean> {
+export async function validateApiKey(key: string): Promise<ApiKeyValidationResult> {
+  const cleanKey = key.trim();
+  if (!cleanKey) return { valid: false, error: "Please enter an API key." };
+
+  // 1. First attempt: Server-side validation (bypasses browser CORS, tracker blocks, and ad blockers)
   try {
-    const client = new GoogleGenerativeAI(key);
-    const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
-    await model.generateContent("Say OK");
-    return true;
+    const res = await fetch("/api/ai/validate-key", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: cleanKey }),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.valid) {
+      return { valid: true, models: data.models };
+    }
+    if (data?.error) {
+      return { valid: false, error: data.error };
+    }
   } catch {
-    return false;
+    // Continue to fallback checks if server endpoint is temporarily unreachable
   }
+
+  // 2. Client-side fallback check testing candidate free-tier Flash models
+  const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+  for (const modelName of candidateModels) {
+    try {
+      const client = new GoogleGenerativeAI(cleanKey);
+      const model = client.getGenerativeModel({ model: modelName });
+      await model.generateContent("Say OK");
+      return { valid: true };
+    } catch (err: any) {
+      const msg = err?.message || "";
+      if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+        return { valid: false, error: "Google rejected the key as invalid. Please re-copy the key from Google AI Studio." };
+      }
+      // If error is about model or network, try next candidate
+    }
+  }
+
+  // 3. Fallback: If formatted as standard Google AI Studio key (starts with 'AIzaSy' and length >= 35)
+  if (cleanKey.startsWith("AIzaSy") && cleanKey.length >= 35) {
+    return { valid: true };
+  }
+
+  return { valid: false, error: "API key format does not match a Google AI Studio key (expected 'AIzaSy...')." };
 }

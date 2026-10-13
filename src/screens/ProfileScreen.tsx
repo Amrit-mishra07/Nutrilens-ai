@@ -34,6 +34,7 @@ export default function ProfileScreen({
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [savedKey, setSavedKey] = useState<string | null>(null);
   const [keyStatus, setKeyStatus] = useState<"idle" | "validating" | "valid" | "invalid">("idle");
+  const [keyErrorMsg, setKeyErrorMsg] = useState("");
   const [showKeyInput, setShowKeyInput] = useState(false);
 
   // Stats
@@ -81,19 +82,31 @@ export default function ProfileScreen({
     saveProfileChanges({ [key]: updated });
   };
 
-  const handleSaveApiKey = async () => {
+  const handleSaveApiKey = async (force = false) => {
     const cleanKey = apiKeyInput.trim();
     if (!cleanKey) {
       clearApiKey();
       setSavedKey(null);
       setKeyStatus("idle");
+      setKeyErrorMsg("");
       onApiKeyChange?.();
       return;
     }
 
+    if (force) {
+      setApiKey(cleanKey);
+      setSavedKey(cleanKey);
+      setKeyStatus("valid");
+      setKeyErrorMsg("");
+      onApiKeyChange?.();
+      setTimeout(() => setShowKeyInput(false), 1200);
+      return;
+    }
+
     setKeyStatus("validating");
-    const isValid = await validateApiKey(cleanKey);
-    if (isValid) {
+    setKeyErrorMsg("");
+    const result = await validateApiKey(cleanKey);
+    if (result.valid) {
       setApiKey(cleanKey);
       setSavedKey(cleanKey);
       setKeyStatus("valid");
@@ -101,6 +114,7 @@ export default function ProfileScreen({
       setTimeout(() => setShowKeyInput(false), 1200);
     } else {
       setKeyStatus("invalid");
+      setKeyErrorMsg(result.error || "Could not verify key with Google AI servers.");
     }
   };
 
@@ -190,7 +204,7 @@ export default function ProfileScreen({
             />
             <div style={{ display: "flex", gap: 8 }}>
               <button
-                onClick={handleSaveApiKey}
+                onClick={() => handleSaveApiKey(false)}
                 disabled={keyStatus === "validating"}
                 style={{
                   flex: 1, padding: "8px 0", borderRadius: 10, fontSize: 12, fontWeight: 700,
@@ -217,9 +231,30 @@ export default function ProfileScreen({
               )}
             </div>
             {keyStatus === "invalid" && (
-              <p style={{ fontSize: 11, color: "#E4483C", margin: 0 }}>
-                Invalid API key. Get one for free at <a href="https://ai.google.dev" target="_blank" rel="noreferrer" style={{ color: "#E4483C", textDecoration: "underline" }}>ai.google.dev</a>
-              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4 }}>
+                <p style={{ fontSize: 11, color: "#E4483C", margin: 0, lineHeight: 1.4 }}>
+                  {keyErrorMsg || "Invalid API key."}
+                </p>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => handleSaveApiKey(true)}
+                    style={{
+                      padding: "6px 12px", borderRadius: 8, fontSize: 11, fontWeight: 700,
+                      background: "#1B7A43", color: "white", border: "none", cursor: "pointer",
+                    }}
+                  >
+                    Save & Use Key Anyway →
+                  </button>
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ fontSize: 11, color: "#5A6472", textDecoration: "underline" }}
+                  >
+                    Get free key at Google AI Studio
+                  </a>
+                </div>
+              </div>
             )}
           </div>
         )}

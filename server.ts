@@ -28,6 +28,34 @@ function getGeminiClient(customApiKey?: string): GoogleGenAI | null {
   });
 }
 
+// Resilient helper trying multiple free-tier Flash models
+async function generateGeminiContentWithFallback(client: GoogleGenAI, contents: any, config?: any) {
+  const candidateModels = [
+    process.env.GEMINI_MODEL,
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+  ].filter(Boolean) as string[];
+
+  let lastErr = null;
+  for (const model of candidateModels) {
+    try {
+      const resp = await client.models.generateContent({
+        model,
+        contents,
+        ...(config ? { config } : {}),
+      });
+      return resp;
+    } catch (err: any) {
+      lastErr = err;
+      if (err?.message?.includes('API_KEY_INVALID') || err?.message?.includes('API key not valid')) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // Support large payloads for base64 food & label photos
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
@@ -517,21 +545,7 @@ If no dishes from the catalog can be recognized, return:
       { text: prompt },
     ];
 
-    const modelCandidate = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    let response;
-    try {
-      response = await client.models.generateContent({
-        model: modelCandidate,
-        contents: { parts },
-        config: { responseMimeType: 'application/json' },
-      });
-    } catch {
-      response = await client.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: { parts },
-        config: { responseMimeType: 'application/json' },
-      });
-    }
+    const response = await generateGeminiContentWithFallback(client, { parts }, { responseMimeType: 'application/json' });
 
     const responseText = response.text || '';
     const cleanJson = responseText.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
@@ -1211,22 +1225,11 @@ CRITICAL: Output ONLY valid JSON. No markdown code blocks, backticks, or outside
       parts.push({ text: promptInstructions });
 
       try {
-        const modelCandidate = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-        let response;
-        try {
-          response = await client.models.generateContent({
-            model: modelCandidate,
-            contents: parts.length === 1 ? parts[0].text : { parts },
-            config: { responseMimeType: 'application/json' },
-          });
-        } catch {
-          // Fallback to gemini-2.0-flash if needed
-          response = await client.models.generateContent({
-            model: 'gemini-2.0-flash',
-            contents: parts.length === 1 ? parts[0].text : { parts },
-            config: { responseMimeType: 'application/json' },
-          });
-        }
+        const response = await generateGeminiContentWithFallback(
+          client,
+          parts.length === 1 ? parts[0].text : { parts },
+          { responseMimeType: 'application/json' }
+        );
 
         const responseText = response.text || '';
         const cleanJson = responseText.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
@@ -1526,6 +1529,50 @@ app.get('/api/scan/search-products', async (req, res) => {
   }
 });
 
+app.post('/api/ai/validate-key', async (req, res) => {
+  try {
+    const key = (req.body?.apiKey || (req.headers['x-gemini-api-key'] as string) || '').trim();
+    if (!key) {
+      return res.status(400).json({ valid: false, error: 'Please enter an API key.' });
+    }
+
+    // Direct Google API check (bypasses browser CORS and ad-blockers)
+    const googleRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (googleRes.ok) {
+      const data = await googleRes.json();
+      const models = (data.models || []).map((m: any) => m.name.replace(/^models\//, ''));
+      return res.json({
+        valid: true,
+        models,
+        message: 'Gemini API key verified successfully.',
+      });
+    }
+
+    const errData = await googleRes.json().catch(() => null);
+    const errMsg = errData?.error?.message || `Google API rejected the key (status ${googleRes.status}).`;
+    return res.status(400).json({
+      valid: false,
+      error: errMsg,
+    });
+  } catch (err: any) {
+    // If Google verification servers timed out, check standard key format
+    const key = (req.body?.apiKey || '').trim();
+    if (key.startsWith('AIzaSy') && key.length >= 35) {
+      return res.json({
+        valid: true,
+        message: 'API key format valid (verification timed out).',
+      });
+    }
+    return res.status(500).json({
+      valid: false,
+      error: err.message || 'Key validation request failed.',
+    });
+  }
+});
+
 app.post('/api/ai/ask', async (req, res) => {
   try {
     const { product, userQuery } = req.body || {};
@@ -1559,19 +1606,7 @@ User Question: "${userQuery}"
 
 Provide a direct, scientifically rigorous, and helpful answer (2-4 sentences max). If they ask about palm oil/palmolein, explain the palmitic acid content and LDL cholesterol/arterial plaque impact. If they ask about healthier swaps, recommend options in the same price range. Maintain an empathetic, educational tone. Do not use markdown headers or bullet lists.`;
 
-    const modelCandidate = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    let response;
-    try {
-      response = await client.models.generateContent({
-        model: modelCandidate,
-        contents: prompt,
-      });
-    } catch {
-      response = await client.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-      });
-    }
+    const response = await generateGeminiContentWithFallback(client, prompt);
 
     const answer = response.text?.trim();
     if (!answer) {
