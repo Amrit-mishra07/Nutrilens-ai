@@ -32,9 +32,10 @@ function getGeminiClient(customApiKey?: string): GoogleGenAI | null {
 async function generateGeminiContentWithFallback(client: GoogleGenAI, contents: any, config?: any) {
   const candidateModels = [
     process.env.GEMINI_MODEL,
+    'gemini-flash-latest',
+    'gemini-3.8-flash',
+    'gemini-flash-lite-latest',
     'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
   ].filter(Boolean) as string[];
 
   let lastErr = null;
@@ -47,6 +48,7 @@ async function generateGeminiContentWithFallback(client: GoogleGenAI, contents: 
       });
       return resp;
     } catch (err: any) {
+      console.warn(`[Gemini Fallback] Model ${model} failed:`, err?.message || err);
       lastErr = err;
       if (err?.message?.includes('API_KEY_INVALID') || err?.message?.includes('API key not valid')) {
         throw err;
