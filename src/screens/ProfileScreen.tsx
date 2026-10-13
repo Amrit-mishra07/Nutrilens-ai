@@ -22,10 +22,10 @@ export default function ProfileScreen({
   navigate: (s: Screen) => void;
   onApiKeyChange?: () => void;
 }) {
-  const [name, setName] = useState("Sarah Chen");
-  const [email, setEmail] = useState("sarah.chen@email.com");
-  const [myAllergens, setMyAllergens] = useState<string[]>(["Peanuts", "Tree nuts"]);
-  const [myDiet, setMyDiet] = useState<string[]>(["Vegetarian"]);
+  const [name, setName] = useState("User");
+  const [email, setEmail] = useState("");
+  const [myAllergens, setMyAllergens] = useState<string[]>([]);
+  const [myDiet, setMyDiet] = useState<string[]>([]);
   const [dailyKcal, setDailyKcal] = useState(2000);
   const [proteinGoal, setProteinGoal] = useState(55);
   const [sodiumLimit, setSodiumLimit] = useState(2300);
@@ -37,30 +37,28 @@ export default function ProfileScreen({
   const [showKeyInput, setShowKeyInput] = useState(false);
 
   // Stats
-  const [stats, setStats] = useState({ totalScans: 47, avgScore: 71, alertCount: 8 });
+  const [stats, setStats] = useState({ totalScans: 0, avgScore: 0, alertCount: 0 });
 
   useEffect(() => {
     const profile = getUserProfile();
-    setName(profile.name || "Sarah Chen");
-    setEmail(profile.email || "sarah.chen@email.com");
-    setMyAllergens(profile.allergens);
-    setMyDiet(profile.dietPreferences);
-    setDailyKcal(profile.dailyCalories);
-    setProteinGoal(profile.proteinGoal);
-    setSodiumLimit(profile.sodiumLimit);
+    setName(profile.name || "User");
+    setEmail(profile.email || "");
+    setMyAllergens(profile.allergens || []);
+    setMyDiet(profile.dietPreferences || []);
+    setDailyKcal(profile.dailyCalories || 2000);
+    setProteinGoal(profile.proteinGoal || 55);
+    setSodiumLimit(profile.sodiumLimit || 2300);
 
     const k = getApiKey();
     setSavedKey(k);
     if (k) setApiKeyInput(k);
 
     const s = getHistoryStats();
-    if (s.totalScans > 0) {
-      setStats({
-        totalScans: s.totalScans,
-        avgScore: s.avgScore,
-        alertCount: s.alertCount,
-      });
-    }
+    setStats({
+      totalScans: s.totalScans,
+      avgScore: s.avgScore,
+      alertCount: s.alertCount,
+    });
   }, []);
 
   const saveProfileChanges = (overrides: Partial<ReturnType<typeof getUserProfile>> = {}) => {
@@ -136,7 +134,7 @@ export default function ProfileScreen({
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
         {[
           { label: "Scans", value: `${stats.totalScans}`, icon: "📷" },
-          { label: "Avg score", value: `${stats.avgScore}`, icon: "⭐" },
+          { label: "Avg score", value: stats.totalScans > 0 ? `${stats.avgScore}` : "—", icon: "⭐" },
           { label: "Alerts caught", value: `${stats.alertCount}`, icon: "🚨" },
         ].map((s) => (
           <div key={s.label} style={{ ...card, padding: 12, textAlign: "center" }}>
